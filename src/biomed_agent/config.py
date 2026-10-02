@@ -52,6 +52,18 @@ class Settings(BaseSettings):
     prompt_version: str = "2026-10-01"
 
 
+def load_env(path: str | Path = ".env") -> None:
+    """Load `.env` into os.environ for libraries that read it directly.
+
+    `Settings` only picks up BIOMED_* values; the Anthropic and Langfuse SDKs read
+    ANTHROPIC_API_KEY / LANGFUSE_* from the process environment. Variables that are
+    already set win over the file. Call this from entry points, not on import.
+    """
+    from dotenv import load_dotenv
+
+    load_dotenv(path, override=False)
+
+
 @lru_cache
 def get_settings() -> Settings:
     return Settings()

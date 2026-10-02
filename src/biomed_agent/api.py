@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from biomed_agent.agent.graph import EvidenceAgent
-from biomed_agent.config import get_settings
+from biomed_agent.config import get_settings, load_env
 from biomed_agent.factory import build_agent
 from biomed_agent.llm import LLMError
 from biomed_agent.schemas import AnswerResponse
@@ -31,6 +31,7 @@ class AskRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    load_env()
     agent, http = build_agent()
     app.state.agent = agent
     yield

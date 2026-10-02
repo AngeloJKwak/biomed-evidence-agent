@@ -7,6 +7,7 @@ import asyncio
 import json
 import textwrap
 
+from biomed_agent.config import load_env
 from biomed_agent.factory import build_agent
 from biomed_agent.tracing import flush
 
@@ -64,6 +65,7 @@ def main() -> None:
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
+    load_env()
 
     if args.cmd == "ask":
         asyncio.run(_ask(args.question, args.json))
