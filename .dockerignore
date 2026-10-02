@@ -1,0 +1,9 @@
+.venv
+.data
+.git
+.claude
+**/__pycache__
+web/node_modules
+web/dist
+evals/results
+.env
