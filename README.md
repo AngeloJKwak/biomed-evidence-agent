@@ -4,6 +4,8 @@ An agentic RAG system that answers clinical-evidence questions from **PubMed** a
 **ClinicalTrials.gov** records. Every claim is cited, checked against the retrieved sources, and
 logged with full provenance.
 
+![The web app answering "Should healthy older adults take low-dose aspirin for primary prevention?": all five agent steps complete, a summary with 11 cited claims marked "Citations verified", and the PubMed sources panel](docs/images/app-answer.png)
+
 > *"Does semaglutide reduce cardiovascular events in adults with obesity but no diabetes?"*
 > → plans PubMed + registry searches, retrieves and ranks passages, checks whether the evidence
 > covers the question (and searches again if not), drafts a cited answer, verifies every
