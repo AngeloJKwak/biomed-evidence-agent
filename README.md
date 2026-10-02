@@ -55,18 +55,19 @@ Every LLM step returns a validated Pydantic model via the Anthropic SDK's `messa
   version (git SHA), model and prompt versions, every search query, a content hash of every
   passage shown to the model, per-call token usage and request ids, and the final answer with
   any citation issues. Any answer can be audited after the fact.
-- **Observability:** optional [Langfuse](https://langfuse.com) tracing. Each question is one
-  trace, with a span per graph step and each Claude call nested as a generation (model, effort,
-  tokens). The agent's own checks (`grounded`, `citation_issues`, `revisions`) are attached as
-  trace scores, and the eval harness adds its metrics to the same traces. Tracing failures are
-  logged and never break an answer. See [Tracing with Langfuse](#tracing-with-langfuse).
+- **Observability:** optional [Langfuse](https://langfuse.com) tracing, audited against
+  Langfuse's [best practices](https://langfuse.com/docs/observability/best-practices). Each
+  question is one trace with a typed span per graph step. Each Claude call is nested as a
+  generation with its prompt, output, thinking summary, tokens, and cost. PII is masked before
+  export, and the agent's own checks are attached as scores. Tracing failures are logged and
+  never break an answer. See [Tracing with Langfuse](#tracing-with-langfuse).
 - **Reliability:** retries with exponential backoff and jitter on 429/5xx from the public
   APIs. A semaphore keeps requests under NCBI's rate limit. Server-side refusal fallback is
   enabled on Claude calls. Truncated or refused structured outputs raise typed errors.
 - **Streaming UX:** `POST /api/ask/stream` streams graph progress as Server-Sent Events. The
   React UI shows each step live, highlights the source when you click a citation, and flags any
   claim that failed verification.
-- **Tests:** 36 tests run offline (no API keys). The PubMed and CT.gov parsers are tested
+- **Tests:** 45 tests run offline (no API keys). The PubMed and CT.gov parsers are tested
   against recorded real API responses. HTTP is mocked with `respx`. The full LangGraph flow
   (revision loop, follow-up retrieval, no-results path, SSE endpoint) runs against a scripted
   LLM.
@@ -130,30 +131,40 @@ Results are written to `evals/results/<timestamp>.{json,md}`.
    LANGFUSE_PUBLIC_KEY=pk-lf-...
    LANGFUSE_SECRET_KEY=sk-lf-...
    LANGFUSE_BASE_URL=https://cloud.langfuse.com      # EU; US is https://us.cloud.langfuse.com
+   LANGFUSE_TRACING_ENVIRONMENT=development            # evals always report as "eval"
    ```
 
 3. Run anything (CLI, web app, or evals). Tracing turns on automatically when the keys are
    present. Set `LANGFUSE_TRACING_ENABLED=false` to turn it off without removing them.
 
-Each run shows up as an `evidence-agent` trace:
+Each question shows up as an `answer-question` trace:
 
 ```
-evidence-agent (agent)        input: question · output: answer · scores: grounded, citation_issues, revisions
-├── plan (chain)
-│   └── claude (generation)   model, effort, input/output tokens
-├── retrieve (retriever)      queries, sources fetched, passages ranked
-├── assess (chain)
-│   └── claude (generation)
-├── generate (chain)
-│   └── claude (generation)
-└── verify (evaluator)
-    └── claude (generation)
+answer-question (agent)               in: question · out: answer (markdown) · scores
+├── plan-searches (chain)
+│   └── write-search-queries (generation)
+├── retrieve-evidence (retriever)     in: queries · out: ranked passages the model will see
+├── assess-coverage (chain)
+│   └── judge-evidence-coverage (generation)
+├── generate-answer (chain)
+│   └── draft-cited-answer (generation)
+└── verify-citations (evaluator)      WARNING level when any citation fails
+    └── check-claim-support (generation)
 ```
 
-The web UI links each answer to its trace, and `evals/run_eval.py` attaches `eval_fact_recall`,
-`eval_source_recall`, `eval_citation_validity`, and `eval_finding_correct` scores to each eval
-run's trace. That makes it easy to filter Langfuse for low-scoring runs and inspect exactly what
-the model saw. The test suite never sends traces, even if keys are exported in your shell.
+| What | Where |
+|---|---|
+| Prompts and outputs | Each generation's input is the role-labeled system/user messages. Its output is the parsed result plus Claude's thinking summary. |
+| Model, tokens, cost | `model`, `model_parameters` (effort, schema), token usage (incl. cache reads), and cost per token bucket. |
+| Scores | `grounded`, `citation_issues`, `revisions` on every trace. Eval runs add `eval_fact_recall`, `eval_source_recall`, `eval_citation_validity`, `eval_finding_correct`. |
+| Filtering | Tags `entrypoint:cli` / `web` / `eval`. Metadata `runId` and `promptVersion` (propagated to every observation). Version = git SHA. |
+| Environments | `development` by default. Eval runs use `eval`, so they stay out of everyday dashboards. |
+| Sessions | Each eval run is one session that groups its agent traces and its `grade-answer` judge traces. |
+| Privacy | Emails, phone numbers, SSNs, MRNs, and dates of birth are redacted from inputs, outputs, and metadata at export (`BIOMED_TRACE_MASK_PII`). This is a safety net, not de-identification. |
+
+All observations set their input and output explicitly. Function arguments and internal agent
+state are never captured. The web UI links each answer to its trace. The test suite never sends
+traces, even if keys are exported in your shell.
 
 ## Configuration
 

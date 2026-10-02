@@ -23,7 +23,8 @@ if TYPE_CHECKING:
 
 
 @lru_cache
-def _git_commit() -> str | None:
+def code_version() -> str | None:
+    """Short git SHA of the running code, or None outside a git checkout."""
     try:
         out = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
@@ -53,7 +54,7 @@ def build_run_record(
     return {
         "run_id": response.run_id,
         "created_at": datetime.now(UTC).isoformat(),
-        "code_version": _git_commit(),
+        "code_version": code_version(),
         "config": {
             "llm_model": settings.llm_model,
             "efforts": {

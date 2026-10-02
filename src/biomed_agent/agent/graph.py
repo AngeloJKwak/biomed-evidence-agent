@@ -27,7 +27,7 @@ from biomed_agent.agent import prompts
 from biomed_agent.config import Settings
 from biomed_agent.grounding import check_citations, normalize_citations
 from biomed_agent.llm import StructuredLLM, UsageTracker
-from biomed_agent.provenance import write_run_record
+from biomed_agent.provenance import code_version, write_run_record
 from biomed_agent.retrieval.store import VectorStore
 from biomed_agent.schemas import (
     AnswerResponse,
@@ -41,7 +41,7 @@ from biomed_agent.schemas import (
 )
 from biomed_agent.sources.clinicaltrials import ClinicalTrialsClient
 from biomed_agent.sources.pubmed import PubMedClient
-from biomed_agent.tracing import RunTrace, observe, trace_run
+from biomed_agent.tracing import RunTrace, observe, trace_run, update_observation
 
 
 def _merge_docs(
@@ -86,8 +86,9 @@ NO_EVIDENCE = DraftAnswer(
 def build_graph(deps: Dependencies, tracker: UsageTracker):
     s = deps.settings
 
-    @observe(name="plan", as_type="chain")
+    @observe(name="plan-searches", as_type="chain")
     async def plan(state: AgentState) -> dict[str, Any]:
+        update_observation(input={"question": state["question"]})
         result = await deps.llm.generate(
             step="plan",
             system=prompts.PLANNER_SYSTEM,
@@ -96,16 +97,21 @@ def build_graph(deps: Dependencies, tracker: UsageTracker):
             effort=s.plan_effort,
             tracker=tracker,
         )
+        update_observation(output=result.model_dump())
         return {
             "pending_pubmed": result.pubmed_queries[:3],
             "pending_trials": result.trials_query,
         }
 
-    @observe(name="retrieve", as_type="retriever")
+    @observe(name="retrieve-evidence", as_type="retriever")
     async def retrieve(state: AgentState) -> dict[str, Any]:
         known = state.get("docs", {})
         pubmed_qs = state.get("pending_pubmed", [])
         trials_q = state.get("pending_trials")
+        round_ = state.get("retrieval_rounds", 0) + 1
+        update_observation(
+            input={"pubmed_queries": pubmed_qs, "trials_query": trials_q, "round": round_}
+        )
 
         id_lists = await asyncio.gather(
             *(deps.pubmed.search(q, s.pubmed_max_results) for q in pubmed_qs)
@@ -124,6 +130,29 @@ def build_graph(deps: Dependencies, tracker: UsageTracker):
         all_ids = [*known.keys(), *new_docs.keys()]
         chunks = await asyncio.to_thread(deps.store.search, state["question"], all_ids, s.top_k)
 
+        all_docs = {**known, **new_docs}
+        update_observation(
+            # The ranked passages are exactly what the model will see as evidence.
+            output=[
+                {
+                    "source_id": c.source_id,
+                    "chunk_id": c.chunk_id,
+                    "score": c.score,
+                    "title": all_docs[c.source_id].title if c.source_id in all_docs else None,
+                    "text": c.text,
+                }
+                for c in chunks
+            ],
+            metadata={
+                "pmids_found": len(new_pmids),
+                "pubmed_docs_added": len(fetched),
+                "trials_added": len(trials),
+                "total_sources": len(all_docs),
+                "passages_returned": len(chunks),
+                "top_k": s.top_k,
+                "embedding_model": deps.store.embedder.name,
+            },
+        )
         return {
             "docs": new_docs,
             "chunks": chunks,
@@ -131,12 +160,22 @@ def build_graph(deps: Dependencies, tracker: UsageTracker):
             + ([f"trials: {trials_q}"] if trials_q else []),
             "pending_pubmed": [],
             "pending_trials": None,
-            "retrieval_rounds": state.get("retrieval_rounds", 0) + 1,
+            "retrieval_rounds": round_,
         }
 
-    @observe(name="assess", as_type="chain")
+    @observe(name="assess-coverage", as_type="chain")
     async def assess(state: AgentState) -> dict[str, Any]:
+        update_observation(
+            input={
+                "question": state["question"],
+                "passages": len(state["chunks"]),
+                "queries_run": state["queries_run"],
+            }
+        )
         if state["retrieval_rounds"] >= s.max_retrieval_rounds:
+            update_observation(
+                output={"decision": "proceed", "reason": "max retrieval rounds reached"}
+            )
             return {}
         evidence = prompts.format_evidence(state["chunks"], state["docs"])
         result = await deps.llm.generate(
@@ -147,6 +186,7 @@ def build_graph(deps: Dependencies, tracker: UsageTracker):
             effort=s.plan_effort,
             tracker=tracker,
         )
+        update_observation(output=result.model_dump())
         if result.sufficient or not (
             result.followup_pubmed_queries or result.followup_trials_query
         ):
@@ -161,9 +201,17 @@ def build_graph(deps: Dependencies, tracker: UsageTracker):
             return "retrieve"
         return "generate"
 
-    @observe(name="generate", as_type="chain")
+    @observe(name="generate-answer", as_type="chain")
     async def generate(state: AgentState) -> dict[str, Any]:
+        update_observation(
+            input={
+                "question": state["question"],
+                "passages": len(state.get("chunks", [])),
+                "revision_feedback": state.get("feedback"),
+            }
+        )
         if not state.get("chunks"):
+            update_observation(output=NO_EVIDENCE.model_dump(), metadata={"no_evidence": True})
             return {"draft": NO_EVIDENCE.model_copy(deep=True)}
         evidence = prompts.format_evidence(state["chunks"], state["docs"])
         draft = await deps.llm.generate(
@@ -174,12 +222,15 @@ def build_graph(deps: Dependencies, tracker: UsageTracker):
             effort=s.answer_effort,
             tracker=tracker,
         )
-        return {"draft": normalize_citations(draft)}
+        draft = normalize_citations(draft)
+        update_observation(output=draft.model_dump())
+        return {"draft": draft}
 
-    @observe(name="verify", as_type="evaluator")
+    @observe(name="verify-citations", as_type="evaluator")
     async def verify(state: AgentState) -> dict[str, Any]:
         draft = state["draft"]
         assert draft is not None
+        update_observation(input={"claims": [c.model_dump() for c in draft.claims]})
         cited_ids = {c.source_id for c in state.get("chunks", [])}
         issues = check_citations(draft, cited_ids)
 
@@ -208,6 +259,12 @@ def build_graph(deps: Dependencies, tracker: UsageTracker):
 
         feedback = (
             "\n".join(f"- Claim {i.claim_index} ({i.kind}): {i.detail}" for i in issues) or None
+        )
+        update_observation(
+            output={"grounded": not issues, "issues": [i.model_dump() for i in issues]},
+            metadata={"llm_checked_claims": len(checkable)},
+            level="WARNING" if issues else None,
+            status_message=f"{len(issues)} citation issue(s)" if issues else None,
         )
         return {"issues": issues, "grounded": not issues, "feedback": feedback}
 
@@ -244,15 +301,20 @@ class EvidenceAgent:
     def __init__(self, deps: Dependencies) -> None:
         self.deps = deps
 
-    async def stream(self, question: str) -> AsyncIterator[dict[str, Any]]:
+    async def stream(
+        self, question: str, *, entrypoint: str = "library", session_id: str | None = None
+    ) -> AsyncIterator[dict[str, Any]]:
         """Yield one progress event per graph node, then `{"node": "done", "result": ...}`.
+
+        `entrypoint` ("cli", "web", "eval", ...) becomes a trace tag; `session_id`
+        groups related traces in Langfuse (e.g. every question in one eval run).
 
         The graph runs in its own task inside a single trace span, and events are
         handed back through a queue. Opening the span inside this generator instead
         would break tracing context across `yield`s (and across SSE clients).
         """
         queue: asyncio.Queue[dict[str, Any] | BaseException | None] = asyncio.Queue()
-        task = asyncio.create_task(self._run(question, queue))
+        task = asyncio.create_task(self._run(question, queue, entrypoint, session_id))
         try:
             while (item := await queue.get()) is not None:
                 if isinstance(item, BaseException):
@@ -263,7 +325,11 @@ class EvidenceAgent:
                 task.cancel()
 
     async def _run(
-        self, question: str, queue: asyncio.Queue[dict[str, Any] | BaseException | None]
+        self,
+        question: str,
+        queue: asyncio.Queue[dict[str, Any] | BaseException | None],
+        entrypoint: str,
+        session_id: str | None,
     ) -> None:
         run_id = uuid.uuid4().hex[:12]
         tracker = UsageTracker()
@@ -273,14 +339,13 @@ class EvidenceAgent:
         s = self.deps.settings
         try:
             with trace_run(
-                "evidence-agent",
+                "answer-question",
                 input={"question": question},
-                metadata={
-                    "run_id": run_id,
-                    "model": s.llm_model,
-                    "prompt_version": s.prompt_version,
-                },
-                tags=[s.llm_model, f"prompts:{s.prompt_version}"],
+                # Propagated to every observation; keys must be alphanumeric.
+                metadata={"runId": run_id, "promptVersion": s.prompt_version},
+                tags=[f"entrypoint:{entrypoint}"],
+                session_id=session_id,
+                version=code_version(),
             ) as trace:
                 async for update in graph.astream({"question": question}, stream_mode="updates"):
                     for node, delta in update.items():
@@ -297,7 +362,7 @@ class EvidenceAgent:
                 result = self._finish(
                     run_id, question, state, tracker, time.perf_counter() - started, trace
                 )
-                trace.set_output(result.answer.model_dump())
+                trace.set_output(answer_markdown(result))
                 trace.score("grounded", float(result.grounded), boolean=True)
                 trace.score("citation_issues", float(len(result.issues)))
                 trace.score("revisions", float(result.revisions))
@@ -309,9 +374,11 @@ class EvidenceAgent:
         finally:
             await queue.put(None)
 
-    async def ask(self, question: str) -> AnswerResponse:
+    async def ask(
+        self, question: str, *, entrypoint: str = "library", session_id: str | None = None
+    ) -> AnswerResponse:
         final: dict[str, Any] | None = None
-        async for event in self.stream(question):
+        async for event in self.stream(question, entrypoint=entrypoint, session_id=session_id):
             if event["node"] == "done":
                 final = event["result"]
         assert final is not None
@@ -358,6 +425,22 @@ class EvidenceAgent:
             embedding_model=self.deps.store.embedder.name,
         )
         return response
+
+
+def answer_markdown(result: AnswerResponse) -> str:
+    """Trace-level output: what a reviewer needs to judge the answer at a glance."""
+    a = result.answer
+    lines = [a.summary, ""]
+    lines += [f"{i + 1}. {c.text} [{', '.join(c.citations)}]" for i, c in enumerate(a.claims)]
+    lines += [
+        "",
+        f"**Evidence quality:** {a.evidence_quality}",
+        f"**Limitations:** {a.limitations}",
+    ]
+    if result.issues:
+        lines += ["", "**Citation issues:**"]
+        lines += [f"- claim {i.claim_index + 1} ({i.kind}): {i.detail}" for i in result.issues]
+    return "\n".join(lines)
 
 
 def _progress(node: str, delta: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:

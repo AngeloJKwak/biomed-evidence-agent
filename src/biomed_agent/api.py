@@ -61,7 +61,7 @@ async def health() -> dict:
 @app.post("/api/ask", response_model=AnswerResponse)
 async def ask(body: AskRequest, request: Request) -> AnswerResponse:
     try:
-        return await _agent(request).ask(body.question)
+        return await _agent(request).ask(body.question, entrypoint="web")
     except anthropic.APIStatusError as e:
         log.exception("Claude API error")
         raise HTTPException(status_code=502, detail=f"LLM provider error: {e.message}") from e
@@ -76,7 +76,7 @@ async def ask_stream(body: AskRequest, request: Request) -> EventSourceResponse:
 
     async def events():
         try:
-            async for event in agent.stream(body.question):
+            async for event in agent.stream(body.question, entrypoint="web"):
                 kind = "result" if event["node"] == "done" else "progress"
                 payload = event.get("result", event)
                 yield {"event": kind, "data": json.dumps(payload, default=str)}

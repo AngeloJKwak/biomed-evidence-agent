@@ -8,7 +8,10 @@ from biomed_agent.api import app
 
 
 class FakeAgent:
-    async def stream(self, question: str):
+    entrypoints: list[str] = []
+
+    async def stream(self, question: str, *, entrypoint: str = "library", session_id=None):
+        self.entrypoints.append(entrypoint)
         yield {"node": "plan", "queries": ["q"], "trials_query": None}
         yield {"node": "done", "result": {"run_id": "abc", "question": question}}
 
@@ -30,6 +33,7 @@ def test_stream_endpoint_emits_progress_then_result() -> None:
     assert [e for e, _ in events] == ["progress", "result"]
     result = json.loads(events[1][1])
     assert result == {"run_id": "abc", "question": "Does aspirin prevent strokes?"}
+    assert FakeAgent.entrypoints[-1] == "web"
 
 
 def test_question_validation() -> None:

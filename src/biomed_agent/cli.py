@@ -15,7 +15,7 @@ from biomed_agent.tracing import flush
 async def _ask(question: str, as_json: bool) -> None:
     agent, http = build_agent()
     try:
-        async for event in agent.stream(question):
+        async for event in agent.stream(question, entrypoint="cli"):
             if event["node"] != "done":
                 if not as_json:
                     details = {k: v for k, v in event.items() if k != "node"}

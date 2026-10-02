@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import statistics
 import time
 from datetime import UTC, datetime
@@ -29,18 +30,11 @@ from pydantic import BaseModel, Field
 from biomed_agent.config import get_settings, load_env
 from biomed_agent.factory import build_agent
 from biomed_agent.grounding import citation_metrics
-from biomed_agent.llm import ClaudeLLM, UsageTracker
+from biomed_agent.llm import MODEL_PRICES, ClaudeLLM, UsageTracker
 from biomed_agent.schemas import AnswerResponse
-from biomed_agent.tracing import flush, score_trace
+from biomed_agent.tracing import flush, score_trace, trace_run
 
 HERE = Path(__file__).parent
-
-# USD per million tokens (input, output). Update if pricing changes.
-PRICES = {
-    "claude-opus-5-5": (4.0, 20.0),
-    "claude-sonnet-5-5": (2.0, 10.0),
-    "claude-haiku-4-5": (1.0, 5.0),
-}
 
 JUDGE_SYSTEM = """\
 You grade a biomedical answer against reference facts taken from the abstract of a landmark trial.
@@ -78,13 +72,16 @@ def judge_prompt(item: dict, result: AnswerResponse) -> str:
 def cost_usd(usage_by_model: dict[str, tuple[int, int]]) -> float:
     total = 0.0
     for model, (tin, tout) in usage_by_model.items():
-        pin, pout = PRICES.get(model, (0.0, 0.0))
+        pin, pout = MODEL_PRICES.get(model, (0.0, 0.0, 0.0, 0.0))[:2]
         total += tin / 1e6 * pin + tout / 1e6 * pout
     return round(total, 4)
 
 
 async def evaluate(limit: int | None, ids: list[str] | None) -> dict:
     settings = get_settings()
+    created_at = datetime.now(UTC).isoformat()
+    # One Langfuse session per eval run groups every agent and judge trace it produced.
+    session_id = f"eval-{created_at[:19].replace(':', '')}"
     items = [json.loads(line) for line in (HERE / "dataset.jsonl").read_text().splitlines() if line]
     if ids:
         items = [i for i in items if i["id"] in ids]
@@ -98,16 +95,29 @@ async def evaluate(limit: int | None, ids: list[str] | None) -> dict:
         for item in items:
             print(f"> {item['id']}: {item['question']}")
             started = time.perf_counter()
-            result = await agent.ask(item["question"])
+            result = await agent.ask(item["question"], entrypoint="eval", session_id=session_id)
             judge_tracker = UsageTracker()
-            verdict = await judge.generate(
-                step="judge",
-                system=JUDGE_SYSTEM,
-                prompt=judge_prompt(item, result),
-                schema=JudgeResult,
-                effort="medium",
-                tracker=judge_tracker,
-            )
+            with trace_run(
+                "grade-answer",
+                as_type="evaluator",
+                input={
+                    "question": item["question"],
+                    "reference_finding": item["finding"],
+                    "reference_facts": item["key_facts"],
+                },
+                metadata={"evalItem": item["id"], "agentTraceId": result.trace_id or ""},
+                tags=["entrypoint:eval"],
+                session_id=session_id,
+            ) as judge_trace:
+                verdict = await judge.generate(
+                    step="judge",
+                    system=JUDGE_SYSTEM,
+                    prompt=judge_prompt(item, result),
+                    schema=JudgeResult,
+                    effort="medium",
+                    tracker=judge_tracker,
+                )
+                judge_trace.set_output(verdict.model_dump())
 
             retrieved = {s.source_id for s in result.sources}
             cited = {c for claim in result.answer.claims for c in claim.citations}
@@ -170,7 +180,8 @@ async def evaluate(limit: int | None, ids: list[str] | None) -> dict:
     }
     summary["total_cost_usd"] = round(sum(r["cost_usd"] for r in rows), 3)
     return {
-        "created_at": datetime.now(UTC).isoformat(),
+        "created_at": created_at,
+        "langfuse_session_id": session_id,
         "config": {
             "llm_model": settings.llm_model,
             "judge_model": settings.judge_model,
@@ -214,6 +225,8 @@ def main() -> None:
     parser.add_argument("--ids", nargs="*", help="Only run these question ids")
     args = parser.parse_args()
     load_env()
+    # Keep eval traffic out of development/production dashboards in Langfuse.
+    os.environ.setdefault("LANGFUSE_TRACING_ENVIRONMENT", "eval")
 
     report = asyncio.run(evaluate(args.limit, args.ids))
     out_dir = HERE / "results"

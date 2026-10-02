@@ -2,11 +2,14 @@
 
 Every LLM step in the graph asks for a Pydantic model back, using the SDK's
 `messages.parse` helper (JSON-schema constrained decoding). Token usage is
-accumulated per run so it can be logged in the provenance record.
+accumulated per run so it can be logged in the provenance record, and each call
+is traced as a Langfuse generation with its prompt, output, thinking summary,
+token usage, and cost.
 """
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Protocol, TypeVar
@@ -16,11 +19,52 @@ from pydantic import BaseModel
 
 from biomed_agent.config import Effort, Settings
 from biomed_agent.schemas import UsageSummary
-from biomed_agent.tracing import observe, record_generation
+from biomed_agent.tracing import observe, update_generation
 
 T = TypeVar("T", bound=BaseModel)
 
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
+
+# USD per million tokens: input, output, cache read, cache write (5-minute TTL).
+MODEL_PRICES: dict[str, tuple[float, float, float, float]] = {
+    "claude-opus-5-5": (4.00, 20.00, 0.20, 5.00),
+    "claude-sonnet-5-5": (2.00, 10.00, 0.20, 2.50),
+    "claude-haiku-4-5": (1.00, 5.00, 0.10, 1.25),
+}
+
+# Trace names for each step's model call: verb-first, stable, never the model's name.
+GENERATION_NAMES = {
+    "plan": "write-search-queries",
+    "assess": "judge-evidence-coverage",
+    "generate": "draft-cited-answer",
+    "verify": "check-claim-support",
+    "judge": "grade-answer",
+}
+
+
+def usage_details(usage: anthropic.types.Usage) -> dict[str, int]:
+    """Token buckets as Langfuse expects them: each token counted exactly once."""
+    details = {"input": usage.input_tokens, "output": usage.output_tokens}
+    if usage.cache_read_input_tokens:
+        details["cache_read_input_tokens"] = usage.cache_read_input_tokens
+    if usage.cache_creation_input_tokens:
+        details["cache_creation_input_tokens"] = usage.cache_creation_input_tokens
+    return details
+
+
+def cost_details(model: str, usage: dict[str, int]) -> dict[str, float] | None:
+    """USD cost per token bucket, or None for models without a known price."""
+    prices = MODEL_PRICES.get(model)
+    if prices is None:
+        return None
+    p_in, p_out, p_cache_read, p_cache_write = prices
+    per_bucket = {
+        "input": p_in,
+        "output": p_out,
+        "cache_read_input_tokens": p_cache_read,
+        "cache_creation_input_tokens": p_cache_write,
+    }
+    return {k: round(n / 1e6 * per_bucket[k], 8) for k, n in usage.items()}
 
 
 class LLMError(RuntimeError):
@@ -93,7 +137,7 @@ class ClaudeLLM:
             fallbacks=settings.llm_fallbacks,
         )
 
-    @observe(name="claude", as_type="generation")
+    @observe(name="llm-call", as_type="generation")
     async def generate(
         self,
         *,
@@ -113,22 +157,63 @@ class ClaudeLLM:
                 "extra_body": {"fallbacks": "default"},
             }
 
+        messages = [{"role": "user", "content": prompt}]
+        # Summarized thinking costs nothing extra (thinking runs either way on this
+        # model family) and puts the model's reasoning for each step in the trace.
+        thinking = {"type": "adaptive", "display": "summarized"}
+        update_generation(
+            name=GENERATION_NAMES.get(step, f"{step}-llm-call"),
+            input=[{"role": "system", "content": system}, *messages],
+            model=self.model,
+            model_parameters={
+                "effort": effort,
+                "max_tokens": self._max_tokens,
+                "thinking": "adaptive/summarized",
+                "output_schema": schema.__name__,
+            },
+        )
+
         start = time.perf_counter()
         response = await self._client.messages.parse(
             model=self.model,
             max_tokens=self._max_tokens,
             system=system,
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
+            thinking=thinking,
             output_format=schema,
             output_config={"effort": effort},
             **extra,
         )
         latency = time.perf_counter() - start
-        record_generation(
-            model=response.model,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-            metadata={"step": step, "effort": effort, "stop_reason": response.stop_reason},
+
+        usage = usage_details(response.usage)
+        thinking_summary = "\n\n".join(
+            b.thinking for b in response.content if b.type == "thinking" and b.thinking
+        )
+        output: dict[str, str] = {
+            "role": "assistant",
+            "content": (
+                json.dumps(response.parsed_output.model_dump(), indent=2)
+                if response.parsed_output is not None
+                else "".join(b.text for b in response.content if b.type == "text")
+            ),
+        }
+        if thinking_summary:
+            output["thinking"] = thinking_summary
+        update_generation(
+            output=output,
+            model=response.model,  # differs from self.model if a refusal fallback ran
+            usage_details=usage,
+            cost_details=cost_details(response.model, usage),
+            metadata={
+                "step": step,
+                "stop_reason": response.stop_reason,
+                "request_id": getattr(response, "_request_id", None),
+            },
+            level="WARNING" if response.stop_reason != "end_turn" else None,
+            status_message=None
+            if response.stop_reason == "end_turn"
+            else f"stop_reason={response.stop_reason}",
         )
 
         if tracker is not None:

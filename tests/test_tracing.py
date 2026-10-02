@@ -61,3 +61,52 @@ def test_load_env_exports_without_overriding(tmp_path, monkeypatch: pytest.Monke
     assert os.environ["LANGFUSE_PUBLIC_KEY"] == "from-shell"
     assert os.environ["BIOMED_TEST_ONLY"] == "1"
     monkeypatch.delenv("BIOMED_TEST_ONLY")
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("email me at jane.doe@example.org", "email me at [EMAIL]"),
+        ("my SSN is 123-45-6789", "my SSN is [SSN]"),
+        ("call (555) 123-4567 today", "call [PHONE] today"),
+        ("MRN: A1234567 was admitted", "[MRN] was admitted"),
+        ("DOB 04/12/1961, on metformin", "[DOB], on metformin"),
+        # Clinical content must survive: trial ids, PMIDs, doses, years, stats.
+        ("NCT03574597 and PMID:37952131", "NCT03574597 and PMID:37952131"),
+        (
+            "2.4 mg weekly, HR 0.80 (95% CI 0.72-0.90), 2023",
+            "2.4 mg weekly, HR 0.80 (95% CI 0.72-0.90), 2023",
+        ),
+        ("17,604 patients", "17,604 patients"),
+    ],
+)
+def test_mask_text(text: str, expected: str) -> None:
+    assert tracing.mask_text(text) == expected
+
+
+def test_mask_pii_patches_only_content_attributes() -> None:
+    from langfuse.types import MaskOtelSpansParams
+
+    class Span:
+        def __init__(self, attributes):
+            self.attributes = attributes
+
+    params = MaskOtelSpansParams.__new__(MaskOtelSpansParams)
+    object.__setattr__(
+        params,
+        "spans",
+        {
+            "a": Span(
+                {
+                    "langfuse.observation.input": '{"q": "I am jane@x.org, take aspirin?"}',
+                    "langfuse.observation.model.name": "claude-opus-5-5",
+                    "some.other.attr": "jane@x.org",
+                }
+            ),
+            "b": Span({"langfuse.observation.output": "no PII here"}),
+        },
+    )
+    result = tracing.mask_pii(params=params)
+    assert set(result.span_patches) == {"a"}
+    patched = result.span_patches["a"].set_attributes
+    assert patched == {"langfuse.observation.input": '{"q": "I am [EMAIL], take aspirin?"}'}
