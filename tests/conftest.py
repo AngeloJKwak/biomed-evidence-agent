@@ -11,6 +11,13 @@ from biomed_agent.llm import CallRecord, UsageTracker
 FIXTURES = Path(__file__).parent / "fixtures"
 
 
+@pytest.fixture(autouse=True)
+def _no_real_tracing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never send test runs to a real Langfuse project, even if keys are exported."""
+    for var in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGFUSE_TRACING_ENABLED"):
+        monkeypatch.delenv(var, raising=False)
+
+
 @pytest.fixture
 def pubmed_xml() -> str:
     return (FIXTURES / "pubmed_efetch.xml").read_text(encoding="utf-8")

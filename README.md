@@ -55,15 +55,18 @@ Every LLM step returns a validated Pydantic model via the Anthropic SDK's `messa
   version (git SHA), model and prompt versions, every search query, a content hash of every
   passage shown to the model, per-call token usage and request ids, and the final answer with
   any citation issues. Any answer can be audited after the fact.
-- **Observability:** optional [Langfuse](https://langfuse.com) tracing. Each Claude call is
-  recorded as a generation with model, tokens, and step. It's a no-op unless keys are set.
+- **Observability:** optional [Langfuse](https://langfuse.com) tracing. Each question is one
+  trace, with a span per graph step and each Claude call nested as a generation (model, effort,
+  tokens). The agent's own checks (`grounded`, `citation_issues`, `revisions`) are attached as
+  trace scores, and the eval harness adds its metrics to the same traces. Tracing failures are
+  logged and never break an answer. See [Tracing with Langfuse](#tracing-with-langfuse).
 - **Reliability:** retries with exponential backoff and jitter on 429/5xx from the public
   APIs. A semaphore keeps requests under NCBI's rate limit. Server-side refusal fallback is
   enabled on Claude calls. Truncated or refused structured outputs raise typed errors.
 - **Streaming UX:** `POST /api/ask/stream` streams graph progress as Server-Sent Events. The
   React UI shows each step live, highlights the source when you click a citation, and flags any
   claim that failed verification.
-- **Tests:** 30 tests run offline (no API keys). The PubMed and CT.gov parsers are tested
+- **Tests:** 36 tests run offline (no API keys). The PubMed and CT.gov parsers are tested
   against recorded real API responses. HTTP is mocked with `respx`. The full LangGraph flow
   (revision loop, follow-up retrieval, no-results path, SSE endpoint) runs against a scripted
   LLM.
@@ -116,6 +119,41 @@ uv run python evals/run_eval.py --ids aspree vital  # specific questions
 ```
 
 Results are written to `evals/results/<timestamp>.{json,md}`.
+
+## Tracing with Langfuse
+
+1. Create a project at [Langfuse](https://langfuse.com) (cloud or self-hosted) and copy its API
+   keys from **Settings → API Keys**.
+2. Add them to `.env`. `LANGFUSE_BASE_URL` must match your project's region:
+
+   ```bash
+   LANGFUSE_PUBLIC_KEY=pk-lf-...
+   LANGFUSE_SECRET_KEY=sk-lf-...
+   LANGFUSE_BASE_URL=https://cloud.langfuse.com      # EU; US is https://us.cloud.langfuse.com
+   ```
+
+3. Run anything (CLI, web app, or evals). Tracing turns on automatically when the keys are
+   present. Set `LANGFUSE_TRACING_ENABLED=false` to turn it off without removing them.
+
+Each run shows up as an `evidence-agent` trace:
+
+```
+evidence-agent (agent)        input: question · output: answer · scores: grounded, citation_issues, revisions
+├── plan (chain)
+│   └── claude (generation)   model, effort, input/output tokens
+├── retrieve (retriever)      queries, sources fetched, passages ranked
+├── assess (chain)
+│   └── claude (generation)
+├── generate (chain)
+│   └── claude (generation)
+└── verify (evaluator)
+    └── claude (generation)
+```
+
+The web UI links each answer to its trace, and `evals/run_eval.py` attaches `eval_fact_recall`,
+`eval_source_recall`, `eval_citation_validity`, and `eval_finding_correct` scores to each eval
+run's trace. That makes it easy to filter Langfuse for low-scoring runs and inspect exactly what
+the model saw. The test suite never sends traces, even if keys are exported in your shell.
 
 ## Configuration
 

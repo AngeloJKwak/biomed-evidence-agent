@@ -120,3 +120,6 @@ class AnswerResponse(BaseModel):
     revisions: int
     latency_s: float
     usage: UsageSummary
+    # Set when Langfuse tracing is enabled.
+    trace_id: str | None = None
+    trace_url: str | None = None

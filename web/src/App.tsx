@@ -262,6 +262,16 @@ function AnswerView({
         <div><dt>Tokens in / out</dt><dd>{result.usage.input_tokens.toLocaleString()} / {result.usage.output_tokens.toLocaleString()}</dd></div>
         <div><dt>Retrieval rounds</dt><dd>{result.retrieval_rounds}</dd></div>
         <div><dt>Revisions</dt><dd>{result.revisions}</dd></div>
+        {result.trace_url && (
+          <div>
+            <dt>Trace</dt>
+            <dd>
+              <a href={result.trace_url} target="_blank" rel="noreferrer">
+                Langfuse ↗
+              </a>
+            </dd>
+          </div>
+        )}
       </dl>
     </section>
   );

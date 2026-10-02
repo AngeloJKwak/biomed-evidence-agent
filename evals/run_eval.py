@@ -26,12 +26,12 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from biomed_agent.config import get_settings
+from biomed_agent.config import get_settings, load_env
 from biomed_agent.factory import build_agent
 from biomed_agent.grounding import citation_metrics
 from biomed_agent.llm import ClaudeLLM, UsageTracker
 from biomed_agent.schemas import AnswerResponse
-from biomed_agent.tracing import flush
+from biomed_agent.tracing import flush, score_trace
 
 HERE = Path(__file__).parent
 
@@ -135,8 +135,14 @@ async def evaluate(limit: int | None, ids: list[str] | None) -> dict:
                     }
                 ),
                 "judge_notes": [f.reason for f in verdict.facts if not f.conveyed],
+                "trace_url": result.trace_url,
             }
             rows.append(row)
+            if result.trace_id:
+                # Eval metrics land on the run's trace, next to the agent's own scores.
+                for metric in ("source_recall", "fact_recall", "citation_validity"):
+                    score_trace(result.trace_id, f"eval_{metric}", float(row[metric]))
+                score_trace(result.trace_id, "eval_finding_correct", float(row["finding_correct"]))
             print(
                 f"  recall={row['source_recall']:.2f} cited={row['cited_expected']} "
                 f"facts={row['fact_recall']:.2f} finding={row['finding_correct']} "
@@ -207,6 +213,7 @@ def main() -> None:
     parser.add_argument("--limit", type=int, help="Only run the first N questions")
     parser.add_argument("--ids", nargs="*", help="Only run these question ids")
     args = parser.parse_args()
+    load_env()
 
     report = asyncio.run(evaluate(args.limit, args.ids))
     out_dir = HERE / "results"

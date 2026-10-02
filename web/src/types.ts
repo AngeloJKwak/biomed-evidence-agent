@@ -47,6 +47,8 @@ export interface AnswerResponse {
     cache_read_input_tokens: number;
     llm_calls: number;
   };
+  trace_id: string | null;
+  trace_url: string | null;
 }
 
 export type NodeName = "plan" | "retrieve" | "assess" | "generate" | "verify" | "revise";

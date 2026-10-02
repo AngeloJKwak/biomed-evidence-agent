@@ -196,6 +196,7 @@ h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: 
 .run-meta div { display: flex; gap: 6px; }
 .run-meta dt { color: var(--text-3); }
 .run-meta dd { margin: 0; color: var(--text-2); }
+.run-meta a { color: var(--accent); text-decoration: none; }
 
 .sources { position: sticky; top: 16px; max-height: calc(100vh - 32px); overflow: auto; padding: 18px; }
 .sources h2 { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
